@@ -31,6 +31,7 @@ class Stats:
     inline_math: int = 0
     low_confidence_inline: List[Tuple[str, str, float, str]] = field(default_factory=list)
     subscript_repairs: int = 0
+    display_math_line_repairs: int = 0
     skipped_unclosed_display_blocks: int = 0
 
     def add_protected(self, kind: str) -> None:
@@ -82,7 +83,11 @@ def normalize_text(text: str) -> str:
     return text
 
 
-def protect_sensitive_regions(text: str, ph: PlaceholderManager) -> str:
+def protect_sensitive_regions(
+    text: str,
+    ph: PlaceholderManager,
+    do_repair: bool = True,
+) -> str:
     """
     保护不应该被公式转换器处理的区域：
     - fenced code block
@@ -102,11 +107,17 @@ def protect_sensitive_regions(text: str, ph: PlaceholderManager) -> str:
     )
 
     # 已经存在的 display math
-    text = ph.protect_regex(
-        text,
-        r"(?s)\$\$.*?\$\$",
-        "EXISTING_DISPLAY_MATH",
-    )
+    display_math_regex = re.compile(r"(?s)\$\$.*?\$\$")
+
+    def protect_display_math(m: re.Match) -> str:
+        block = m.group(0)
+        if do_repair:
+            inner = block[2:-2]
+            inner = repair_copied_display_math_lines(inner, ph.stats)
+            block = f"$${inner}$$"
+        return ph.add(block, "EXISTING_DISPLAY_MATH")
+
+    text = display_math_regex.sub(protect_display_math, text)
 
     # 已经存在的 inline math，避免匹配 $$
     text = ph.protect_regex(
@@ -216,6 +227,7 @@ def convert_display_math_blocks(text: str, stats: Stats, do_repair: bool = True)
 
                 if is_display_math_like(content):
                     if do_repair:
+                        content = repair_copied_display_math_lines(content, stats)
                         content = repair_formula(content, stats)
 
                     out.append("$$")
@@ -442,6 +454,97 @@ def repair_formula(formula: str, stats: Stats) -> str:
     return formula
 
 
+def operator_from_copied_rule_line(line: str) -> str | None:
+    stripped = line.strip()
+
+    if len(stripped) < 3:
+        return None
+
+    if set(stripped) == {"="}:
+        return "="
+
+    if set(stripped) == {"-"}:
+        return "-"
+
+    return None
+
+
+def repair_copied_display_math_lines(content: str, stats: Stats) -> str:
+    r"""
+    修复 ChatGPT 网页复制公式时出现的 Markdown setext 标题伪影，例如：
+
+        \dot{\xi}
+        =========
+
+        # \hat f(\xi)
+
+        \sum ...
+
+    还原为：
+
+        \dot{\xi} = \hat f(\xi) = \sum ...
+    """
+
+    lines = content.split("\n")
+    out: List[str] = []
+    repairs = 0
+    carry_operator: str | None = None
+
+    i = 0
+
+    def previous_non_empty_index() -> int | None:
+        for idx in range(len(out) - 1, -1, -1):
+            if out[idx].strip():
+                return idx
+        return None
+
+    while i < len(lines):
+        line = lines[i]
+        operator = operator_from_copied_rule_line(line)
+
+        if operator:
+            prev_idx = previous_non_empty_index()
+            next_idx = i + 1
+
+            while next_idx < len(lines) and not lines[next_idx].strip():
+                next_idx += 1
+
+            if prev_idx is not None and next_idx < len(lines):
+                next_term = lines[next_idx].strip()
+                had_hash_prefix = next_term.startswith("#")
+
+                if had_hash_prefix:
+                    next_term = re.sub(r"^#+\s*", "", next_term).strip()
+
+                while len(out) - 1 > prev_idx:
+                    out.pop()
+
+                out[prev_idx] = f"{out[prev_idx].rstrip()} {operator} {next_term}"
+                repairs += 1
+                carry_operator = operator if had_hash_prefix else None
+                i = next_idx + 1
+                continue
+
+        if carry_operator and not line.strip():
+            i += 1
+            continue
+
+        if carry_operator and line.strip():
+            out[-1] = f"{out[-1].rstrip()} {carry_operator} {line.strip()}"
+            repairs += 1
+            carry_operator = None
+            i += 1
+            continue
+
+        out.append(line)
+        i += 1
+
+    if repairs:
+        stats.display_math_line_repairs += repairs
+
+    return "\n".join(out)
+
+
 def format_report(stats: Stats, max_low_confidence: int = 30) -> str:
     """
     生成转换报告。
@@ -454,6 +557,7 @@ def format_report(stats: Stats, max_low_confidence: int = 30) -> str:
     lines.append(f"块公式转换：{stats.display_math_blocks}")
     lines.append(f"行内公式转换：{stats.inline_math}")
     lines.append(f"公式内部修复：{stats.subscript_repairs}")
+    lines.append(f"公式换行伪影修复：{stats.display_math_line_repairs}")
     lines.append(f"未闭合块公式跳过：{stats.skipped_unclosed_display_blocks}")
 
     if stats.protected:
@@ -496,7 +600,7 @@ def convert_text(
     text = normalize_text(text)
 
     # 1. 保护代码、链接、已存在公式
-    text = protect_sensitive_regions(text, ph)
+    text = protect_sensitive_regions(text, ph, do_repair=do_repair)
 
     # 2. 转换块公式
     text = convert_display_math_blocks(
