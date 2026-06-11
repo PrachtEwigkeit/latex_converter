@@ -115,16 +115,34 @@ def protect_sensitive_regions(
         if do_repair:
             inner = block[2:-2]
             inner = repair_copied_display_math_lines(inner, ph.stats)
+            before_hash_repair = inner
+            inner = repair_latex_hashes(inner)
+            if inner != before_hash_repair:
+                ph.stats.subscript_repairs += 1
             block = f"$${inner}$$"
         return ph.add(block, "EXISTING_DISPLAY_MATH")
 
     text = display_math_regex.sub(protect_display_math, text)
 
     # 已经存在的 inline math，避免匹配 $$
-    text = ph.protect_regex(
+    inline_math_regex = re.compile(
+        r"(?<!\$)\$(?!\$)(?:\\.|[^$\n])+(?<!\$)\$(?!\$)"
+    )
+
+    def protect_inline_math(m: re.Match) -> str:
+        block = m.group(0)
+        if do_repair:
+            inner = block[1:-1]
+            before_hash_repair = inner
+            inner = repair_latex_hashes(inner)
+            if inner != before_hash_repair:
+                ph.stats.subscript_repairs += 1
+            block = f"${inner}$"
+        return ph.add(block, "EXISTING_INLINE_MATH")
+
+    text = inline_math_regex.sub(
+        protect_inline_math,
         text,
-        r"(?<!\$)\$(?!\$)(?:\\.|[^$\n])+(?<!\$)\$(?!\$)",
-        "EXISTING_INLINE_MATH",
     )
 
     # 行内代码：`...`
@@ -446,12 +464,26 @@ def repair_formula(formula: str, stats: Stats) -> str:
         formula,
     )
 
+    # J(q)^# -> J(q)^{\#}
+    # KaTeX/LaTeX treats a raw # as a special character, so escape it.
+    formula = repair_latex_hashes(formula)
+
     # 清理多余空格
     formula = re.sub(r"[ \t]+", " ", formula).strip()
 
     if formula != before:
         stats.subscript_repairs += 1
 
+    return formula
+
+
+def repair_latex_hashes(formula: str) -> str:
+    """
+    修复 KaTeX/LaTeX 中未转义的 #。
+    """
+
+    formula = re.sub(r"\^\s*#", r"^{\\#}", formula)
+    formula = re.sub(r"(?<!\\)#", r"\\#", formula)
     return formula
 
 

@@ -21,7 +21,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -114,16 +114,34 @@ def protect_sensitive_regions(
         if do_repair:
             inner = block[2:-2]
             inner = repair_copied_display_math_lines(inner, ph.stats)
+            before_hash_repair = inner
+            inner = repair_latex_hashes(inner)
+            if inner != before_hash_repair:
+                ph.stats.subscript_repairs += 1
             block = f"$${inner}$$"
         return ph.add(block, "EXISTING_DISPLAY_MATH")
 
     text = display_math_regex.sub(protect_display_math, text)
 
     # 已经存在的 inline math，避免匹配 $$
-    text = ph.protect_regex(
+    inline_math_regex = re.compile(
+        r"(?<!\$)\$(?!\$)(?:\\.|[^$\n])+(?<!\$)\$(?!\$)"
+    )
+
+    def protect_inline_math(m: re.Match) -> str:
+        block = m.group(0)
+        if do_repair:
+            inner = block[1:-1]
+            before_hash_repair = inner
+            inner = repair_latex_hashes(inner)
+            if inner != before_hash_repair:
+                ph.stats.subscript_repairs += 1
+            block = f"${inner}$"
+        return ph.add(block, "EXISTING_INLINE_MATH")
+
+    text = inline_math_regex.sub(
+        protect_inline_math,
         text,
-        r"(?<!\$)\$(?!\$)(?:\\.|[^$\n])+(?<!\$)\$(?!\$)",
-        "EXISTING_INLINE_MATH",
     )
 
     # 行内代码：`...`
@@ -445,6 +463,10 @@ def repair_formula(formula: str, stats: Stats) -> str:
         formula,
     )
 
+    # J(q)^# -> J(q)^{\#}
+    # KaTeX/LaTeX treats a raw # as a special character, so escape it.
+    formula = repair_latex_hashes(formula)
+
     # 清理多余空格
     formula = re.sub(r"[ \t]+", " ", formula).strip()
 
@@ -454,7 +476,17 @@ def repair_formula(formula: str, stats: Stats) -> str:
     return formula
 
 
-def operator_from_copied_rule_line(line: str) -> str | None:
+def repair_latex_hashes(formula: str) -> str:
+    """
+    修复 KaTeX/LaTeX 中未转义的 #。
+    """
+
+    formula = re.sub(r"\^\s*#", r"^{\\#}", formula)
+    formula = re.sub(r"(?<!\\)#", r"\\#", formula)
+    return formula
+
+
+def operator_from_copied_rule_line(line: str) -> Optional[str]:
     stripped = line.strip()
 
     if len(stripped) < 3:
@@ -488,11 +520,11 @@ def repair_copied_display_math_lines(content: str, stats: Stats) -> str:
     lines = content.split("\n")
     out: List[str] = []
     repairs = 0
-    carry_operator: str | None = None
+    carry_operator: Optional[str] = None
 
     i = 0
 
-    def previous_non_empty_index() -> int | None:
+    def previous_non_empty_index() -> Optional[int]:
         for idx in range(len(out) - 1, -1, -1):
             if out[idx].strip():
                 return idx
