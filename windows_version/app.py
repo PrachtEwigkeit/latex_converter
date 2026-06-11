@@ -2,7 +2,7 @@
 
 import streamlit as st
 
-from windows_version.chatgpt_latex_cleaner import (
+from chatgpt_latex_cleaner import (
     convert_text,
     format_report,
     read_clipboard,

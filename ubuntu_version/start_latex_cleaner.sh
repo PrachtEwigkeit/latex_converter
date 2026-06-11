@@ -103,6 +103,9 @@ if ! "$PYTHON_BIN" -c 'import streamlit' >/dev/null 2>&1; then
 fi
 
 PORT="$BASE_PORT"
+PORT_ATTEMPTS=0
+MAX_PORT_ATTEMPTS=100
+
 while ! "$PYTHON_BIN" -c 'import socket, sys
 port = int(sys.argv[1])
 sock = socket.socket()
@@ -114,6 +117,14 @@ finally:
     sock.close()
 ' "$PORT" >/dev/null 2>&1; do
     PORT=$((PORT + 1))
+    PORT_ATTEMPTS=$((PORT_ATTEMPTS + 1))
+
+    if [[ "$PORT_ATTEMPTS" -ge "$MAX_PORT_ATTEMPTS" ]]; then
+        echo "[ERROR] Could not find a free local port from $BASE_PORT to $((PORT - 1))."
+        echo "If you are running inside a restricted sandbox, local port binding may be blocked."
+        echo "Otherwise, try another start port: ./start_latex_cleaner.sh --port 8600"
+        exit 1
+    fi
 done
 
 echo "Python: $PYTHON_BIN"
