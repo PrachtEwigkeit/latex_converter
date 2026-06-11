@@ -1,0 +1,945 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+ChatGPT 网页复制文本公式清洗脚本
+
+功能：
+1. 把单独一行的 [ ... ] 块公式转成 $$ ... $$。
+2. 把疑似行内公式的 (...) 转成 $...$。
+3. 保护代码块、行内代码、Markdown 链接、引用链接，避免误处理。
+4. 修复部分 ChatGPT 复制时造成的公式损坏，例如：
+   {q_i}*{i=1}^N  ->  {q_i}_{i=1}^N
+   \\mathcal M*{y^*} -> \\mathcal M_{y^*}
+5. 输出转换报告，方便人工检查。
+"""
+
+import argparse
+import base64
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+
+@dataclass
+class Stats:
+    protected: Dict[str, int] = field(default_factory=dict)
+    display_math_blocks: int = 0
+    inline_math: int = 0
+    low_confidence_inline: List[Tuple[str, str, float, str]] = field(default_factory=list)
+    subscript_repairs: int = 0
+    display_math_line_repairs: int = 0
+    skipped_unclosed_display_blocks: int = 0
+
+    def add_protected(self, kind: str) -> None:
+        self.protected[kind] = self.protected.get(kind, 0) + 1
+
+
+class PlaceholderManager:
+    """
+    用占位符临时保护不该被处理的区域。
+    """
+
+    def __init__(self, stats: Stats):
+        self.stats = stats
+        self.items: List[Tuple[str, str]] = []
+
+    def add(self, text: str, kind: str) -> str:
+        key = f"@@__CGPT_LATEX_{kind}_{len(self.items)}__@@"
+        self.items.append((key, text))
+        self.stats.add_protected(kind)
+        return key
+
+    def protect_regex(self, text: str, pattern: str, kind: str, flags: int = 0) -> str:
+        regex = re.compile(pattern, flags)
+
+        def repl(m: re.Match) -> str:
+            return self.add(m.group(0), kind)
+
+        return regex.sub(repl, text)
+
+    def restore(self, text: str) -> str:
+        for key, value in reversed(self.items):
+            text = text.replace(key, value)
+        return text
+
+
+@dataclass
+class MathDecision:
+    ok: bool
+    confidence: float = 0.0
+    reason: str = ""
+
+
+def normalize_text(text: str) -> str:
+    """
+    统一换行和行尾空格。
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = "\n".join(line.rstrip() for line in text.split("\n"))
+    return text
+
+
+def protect_sensitive_regions(
+    text: str,
+    ph: PlaceholderManager,
+    do_repair: bool = True,
+) -> str:
+    """
+    保护不应该被公式转换器处理的区域：
+    - fenced code block
+    - 已存在的 LaTeX display/inline math
+    - 行内代码
+    - Markdown 引用链接定义
+    - Markdown 链接
+    - Markdown 引用链接
+    - 原始 URL
+    """
+
+    # 代码块：```...``` 或 ~~~...~~~
+    text = ph.protect_regex(
+        text,
+        r"(?ms)^([ \t]*(```|~~~)[^\n]*\n.*?\n[ \t]*\2[ \t]*)$",
+        "CODE_BLOCK",
+    )
+
+    # 已经存在的 display math
+    display_math_regex = re.compile(r"(?s)\$\$.*?\$\$")
+
+    def protect_display_math(m: re.Match) -> str:
+        block = m.group(0)
+        if do_repair:
+            inner = block[2:-2]
+            inner = repair_copied_display_math_lines(inner, ph.stats)
+            block = f"$${inner}$$"
+        return ph.add(block, "EXISTING_DISPLAY_MATH")
+
+    text = display_math_regex.sub(protect_display_math, text)
+
+    # 已经存在的 inline math，避免匹配 $$
+    text = ph.protect_regex(
+        text,
+        r"(?<!\$)\$(?!\$)(?:\\.|[^$\n])+(?<!\$)\$(?!\$)",
+        "EXISTING_INLINE_MATH",
+    )
+
+    # 行内代码：`...`
+    text = ph.protect_regex(
+        text,
+        r"`[^`\n]*`",
+        "INLINE_CODE",
+    )
+
+    # Markdown 引用链接定义：[1]: https://...
+    text = ph.protect_regex(
+        text,
+        r"(?m)^[ \t]*\[[^\]\n]+\]:[ \t]+\S.*$",
+        "MD_REF_DEF",
+    )
+
+    # Markdown 行内链接：[text](url), ![alt](url)
+    text = ph.protect_regex(
+        text,
+        r"!?\[[^\]\n]*\]\([^\)\n]*\)",
+        "MD_INLINE_LINK",
+    )
+
+    # Markdown 引用链接：[arXiv][1]
+    text = ph.protect_regex(
+        text,
+        r"\[[^\]\n]+\]\[[^\]\n]*\]",
+        "MD_REF_LINK",
+    )
+
+    # 原始 URL
+    text = ph.protect_regex(
+        text,
+        r"https?://[^\s<>()]+(?:\([^\s<>()]*\)[^\s<>()]*)*",
+        "RAW_URL",
+    )
+
+    return text
+
+
+def is_display_math_like(content: str) -> bool:
+    """
+    判断单独 [ ... ] 里面的内容是否像块公式。
+    """
+    s = content.strip()
+
+    if not s:
+        return False
+
+    if "@@__CGPT_LATEX_" in s:
+        return False
+
+    if "\\" in s:
+        return True
+
+    if any(ch in s for ch in "=<>^_∈∉⊂⊆≈≠≤≥→←↦±×·∂∑∫∞"):
+        return True
+
+    if re.search(r"\b(?:dim|Null|Rank|FK|IK|SE|SO|log|sin|cos|tan|exp)\b", s):
+        return True
+
+    # 短的纯符号块，也很可能是公式
+    if not re.search(r"[\u4e00-\u9fff]", s) and len(s) <= 200:
+        if re.search(r"[A-Za-z]", s):
+            return True
+
+    return False
+
+
+def convert_display_math_blocks(text: str, stats: Stats, do_repair: bool = True) -> str:
+    """
+    把 ChatGPT 复制出来的：
+
+    [
+    formula
+    ]
+
+    转为：
+
+    $$
+    formula
+    $$
+    """
+
+    lines = text.split("\n")
+    out: List[str] = []
+
+    i = 0
+
+    while i < len(lines):
+        if lines[i].strip() == "[":
+            j = i + 1
+            block: List[str] = []
+
+            while j < len(lines) and lines[j].strip() != "]":
+                block.append(lines[j])
+                j += 1
+
+            if j < len(lines) and lines[j].strip() == "]":
+                content = "\n".join(block).strip("\n")
+
+                if is_display_math_like(content):
+                    if do_repair:
+                        content = repair_copied_display_math_lines(content, stats)
+                        content = repair_formula(content, stats)
+
+                    out.append("$$")
+                    out.extend(content.split("\n"))
+                    out.append("$$")
+
+                    stats.display_math_blocks += 1
+                    i = j + 1
+                    continue
+
+            # 没找到闭合 ]，或者内容不像公式，就原样保留
+            if j >= len(lines):
+                stats.skipped_unclosed_display_blocks += 1
+
+        out.append(lines[i])
+        i += 1
+
+    return "\n".join(out)
+
+
+def protect_display_math_after_conversion(text: str, ph: PlaceholderManager) -> str:
+    """
+    转换完 display math 后，保护 $$...$$。
+    否则后续行内括号扫描器会把块公式内部的 (q)、(T^*) 等也处理一遍。
+    """
+    return ph.protect_regex(
+        text,
+        r"(?s)\$\$.*?\$\$",
+        "GENERATED_DISPLAY_MATH",
+    )
+
+
+def decide_math_like(content: str, allow_single_letter: bool = True) -> MathDecision:
+    """
+    判断括号 (...) 内部是否像行内公式。
+    """
+
+    s = content.strip()
+
+    if not s:
+        return MathDecision(False, reason="empty")
+
+    if "\n" in s:
+        return MathDecision(False, reason="multiline")
+
+    if "@@__CGPT_LATEX_" in s:
+        return MathDecision(False, reason="placeholder")
+
+    if "$" in s:
+        return MathDecision(False, reason="already_math")
+
+    if len(s) > 180 and "\\" not in s:
+        return MathDecision(False, reason="too_long")
+
+    if re.search(r"https?://|www\.|[\w.-]+@[\w.-]+", s):
+        return MathDecision(False, reason="url_or_email")
+
+    if "[" in s or "]" in s:
+        return MathDecision(False, reason="markdown_link_like")
+
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        return MathDecision(False, reason="plain_number")
+
+    has_chinese = bool(re.search(r"[\u4e00-\u9fff]", s))
+
+    # 强特征 1：LaTeX 命令
+    if "\\" in s:
+        return MathDecision(True, 0.98, "latex_command")
+
+    # 强特征 2：数学符号、关系符号、上下标
+    if any(ch in s for ch in "=<>^_∈∉⊂⊆≈≠≤≥→←↦±×·∂∑∫∞"):
+        return MathDecision(True, 0.92, "math_symbol")
+
+    # 含中文且没有强数学特征，一般不是公式
+    if has_chinese:
+        return MathDecision(False, reason="chinese_without_math_symbol")
+
+    # 常见数学/机器人学对象或函数
+    if re.search(r"\b(?:Null|Rank|dim|log|sin|cos|tan|exp|FK|IK)\s*\(", s):
+        return MathDecision(True, 0.88, "known_function_call")
+
+    # 一般函数调用：f(q), J(q_i), T(q)
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*\s*\(.+\)", s):
+        return MathDecision(True, 0.80, "function_call")
+
+    # 形如 J^#, q_i, y^*, T_ee
+    if re.fullmatch(r"[A-Za-z](?:[A-Za-z0-9]*)?(?:[_^][A-Za-z0-9*#{}\\]+)+", s):
+        return MathDecision(True, 0.86, "subscript_or_superscript")
+
+    # 空间写法：SE3, SO3, R3
+    if re.fullmatch(r"(?:SE|SO|R|N|Z|Q)\d+", s):
+        return MathDecision(True, 0.70, "math_space_short")
+
+    # 单字母变量：q, y, M, T, J, v, e...
+    # 这是最容易误伤的规则，所以置信度较低。
+    # 可以用 --strict 关闭。
+    if allow_single_letter and re.fullmatch(r"[A-Za-z]", s):
+        return MathDecision(True, 0.55, "single_letter_variable")
+
+    # 少量希腊字母英文名，如果复制时没有反斜杠
+    if re.fullmatch(r"(?:phi|theta|alpha|beta|gamma|lambda|epsilon|Delta)", s):
+        return MathDecision(True, 0.65, "greek_name")
+
+    return MathDecision(False, reason="not_math_like")
+
+
+def find_matching_paren(text: str, start: int) -> int:
+    """
+    start 指向 '('。
+    返回匹配 ')' 的 index。
+    找不到则返回 -1。
+    支持嵌套括号。
+    """
+
+    depth = 0
+
+    for i in range(start, len(text)):
+        ch = text[i]
+
+        if ch == "(":
+            depth += 1
+
+        elif ch == ")":
+            depth -= 1
+
+            if depth == 0:
+                return i
+
+    return -1
+
+
+def convert_inline_math_parentheses(
+    text: str,
+    stats: Stats,
+    allow_single_letter: bool = True,
+    do_repair: bool = True,
+) -> str:
+    """
+    把形如：
+
+    (f(q)=y)
+    (q_i)
+    (\\mathcal M_{y^*})
+
+    转成：
+
+    $f(q)=y$
+    $q_i$
+    $\\mathcal M_{y^*}$
+    """
+
+    out: List[str] = []
+
+    i = 0
+    n = len(text)
+
+    while i < n:
+        ch = text[i]
+
+        if ch == "(":
+            end = find_matching_paren(text, i)
+
+            if end != -1:
+                content = text[i + 1 : end]
+                decision = decide_math_like(
+                    content,
+                    allow_single_letter=allow_single_letter,
+                )
+
+                if decision.ok:
+                    formula = content.strip()
+
+                    if do_repair:
+                        formula = repair_formula(formula, stats)
+
+                    out.append(f"${formula}$")
+
+                    stats.inline_math += 1
+
+                    if decision.confidence < 0.70:
+                        stats.low_confidence_inline.append(
+                            (content, formula, decision.confidence, decision.reason)
+                        )
+
+                    i = end + 1
+                    continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def repair_formula(formula: str, stats: Stats) -> str:
+    """
+    只对已经识别出的公式内容做修复。
+
+    主要修复 ChatGPT 复制时把下标 _ 复制成 * 的情况。
+    """
+
+    before = formula
+
+    # {q_i}*{i=1}^N  ->  {q_i}_{i=1}^N
+    formula = re.sub(
+        r"\}\s*\*\s*\{",
+        r"}_{",
+        formula,
+    )
+
+    # \mathcal M*{y^*} -> \mathcal M_{y^*}
+    # M*{y^*}          -> M_{y^*}
+    formula = re.sub(
+        r"(\\mathcal\s*\{?[A-Za-z]\}?|\\[A-Za-z]+|[A-Za-z])\s*\*\s*\{",
+        r"\1_{",
+        formula,
+    )
+
+    # 清理多余空格
+    formula = re.sub(r"[ \t]+", " ", formula).strip()
+
+    if formula != before:
+        stats.subscript_repairs += 1
+
+    return formula
+
+
+def operator_from_copied_rule_line(line: str) -> Optional[str]:
+    stripped = line.strip()
+
+    if len(stripped) < 3:
+        return None
+
+    if set(stripped) == {"="}:
+        return "="
+
+    if set(stripped) == {"-"}:
+        return "-"
+
+    return None
+
+
+def repair_copied_display_math_lines(content: str, stats: Stats) -> str:
+    r"""
+    修复 ChatGPT 网页复制公式时出现的 Markdown setext 标题伪影，例如：
+
+        \dot{\xi}
+        =========
+
+        # \hat f(\xi)
+
+        \sum ...
+
+    还原为：
+
+        \dot{\xi} = \hat f(\xi) = \sum ...
+    """
+
+    lines = content.split("\n")
+    out: List[str] = []
+    repairs = 0
+    carry_operator: Optional[str] = None
+
+    i = 0
+
+    def previous_non_empty_index() -> Optional[int]:
+        for idx in range(len(out) - 1, -1, -1):
+            if out[idx].strip():
+                return idx
+        return None
+
+    while i < len(lines):
+        line = lines[i]
+        operator = operator_from_copied_rule_line(line)
+
+        if operator:
+            prev_idx = previous_non_empty_index()
+            next_idx = i + 1
+
+            while next_idx < len(lines) and not lines[next_idx].strip():
+                next_idx += 1
+
+            if prev_idx is not None and next_idx < len(lines):
+                next_term = lines[next_idx].strip()
+                had_hash_prefix = next_term.startswith("#")
+
+                if had_hash_prefix:
+                    next_term = re.sub(r"^#+\s*", "", next_term).strip()
+
+                while len(out) - 1 > prev_idx:
+                    out.pop()
+
+                out[prev_idx] = f"{out[prev_idx].rstrip()} {operator} {next_term}"
+                repairs += 1
+                carry_operator = operator if had_hash_prefix else None
+                i = next_idx + 1
+                continue
+
+        if carry_operator and not line.strip():
+            i += 1
+            continue
+
+        if carry_operator and line.strip():
+            out[-1] = f"{out[-1].rstrip()} {carry_operator} {line.strip()}"
+            repairs += 1
+            carry_operator = None
+            i += 1
+            continue
+
+        out.append(line)
+        i += 1
+
+    if repairs:
+        stats.display_math_line_repairs += repairs
+
+    return "\n".join(out)
+
+
+def format_report(stats: Stats, max_low_confidence: int = 30) -> str:
+    """
+    生成转换报告。
+    """
+
+    lines = []
+
+    lines.append("转换报告")
+    lines.append("-" * 40)
+    lines.append(f"块公式转换：{stats.display_math_blocks}")
+    lines.append(f"行内公式转换：{stats.inline_math}")
+    lines.append(f"公式内部修复：{stats.subscript_repairs}")
+    lines.append(f"公式换行伪影修复：{stats.display_math_line_repairs}")
+    lines.append(f"未闭合块公式跳过：{stats.skipped_unclosed_display_blocks}")
+
+    if stats.protected:
+        lines.append("")
+        lines.append("保护区域：")
+        for k, v in sorted(stats.protected.items()):
+            lines.append(f"- {k}: {v}")
+
+    if stats.low_confidence_inline:
+        lines.append("")
+        lines.append("低置信度行内公式转换，请人工快速检查：")
+
+        for idx, (src, dst, conf, reason) in enumerate(
+            stats.low_confidence_inline[:max_low_confidence],
+            1,
+        ):
+            lines.append(
+                f"{idx}. ({src}) -> ${dst}$  confidence={conf:.2f}, reason={reason}"
+            )
+
+        remaining = len(stats.low_confidence_inline) - max_low_confidence
+        if remaining > 0:
+            lines.append(f"... 还有 {remaining} 条未显示")
+
+    return "\n".join(lines)
+
+
+def convert_text(
+    text: str,
+    allow_single_letter: bool = True,
+    do_repair: bool = True,
+) -> Tuple[str, Stats]:
+    """
+    总转换入口。
+    """
+
+    stats = Stats()
+    ph = PlaceholderManager(stats)
+
+    text = normalize_text(text)
+
+    # 1. 保护代码、链接、已存在公式
+    text = protect_sensitive_regions(text, ph, do_repair=do_repair)
+
+    # 2. 转换块公式
+    text = convert_display_math_blocks(
+        text,
+        stats,
+        do_repair=do_repair,
+    )
+
+    # 3. 保护刚生成的 $$...$$，防止行内公式处理器误伤块公式内部
+    text = protect_display_math_after_conversion(text, ph)
+
+    # 4. 转换行内公式
+    text = convert_inline_math_parentheses(
+        text,
+        stats,
+        allow_single_letter=allow_single_letter,
+        do_repair=do_repair,
+    )
+
+    # 5. 恢复被保护的区域
+    text = ph.restore(text)
+
+    return text, stats
+
+
+def read_clipboard() -> str:
+    """
+    从剪贴板读取。
+    Ubuntu 下优先使用系统剪贴板工具；之后尝试 pyperclip 和 tkinter 兜底。
+    """
+
+    if sys.platform.startswith("win"):
+        try:
+            return _read_clipboard_windows()
+        except RuntimeError:
+            pass
+
+    if sys.platform.startswith("linux"):
+        try:
+            return _read_clipboard_linux()
+        except RuntimeError:
+            pass
+
+    try:
+        import pyperclip  # type: ignore
+    except ImportError:
+        pyperclip = None
+
+    if pyperclip is not None:
+        try:
+            return pyperclip.paste()
+        except Exception:
+            pass
+
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+        root.update()
+
+        try:
+            return root.clipboard_get()
+        except tk.TclError:
+            return ""
+        finally:
+            root.destroy()
+    except Exception as e:
+        raise RuntimeError(
+            "无法读取剪贴板：请安装 wl-clipboard（Wayland）或 xclip/xsel（X11），"
+            "并确认当前会话可以访问图形桌面剪贴板。"
+        ) from e
+
+
+def write_clipboard(text: str) -> None:
+    """
+    写入剪贴板。
+    Ubuntu 下优先使用系统剪贴板工具；之后尝试 pyperclip 和 tkinter 兜底。
+    """
+
+    if sys.platform.startswith("win"):
+        try:
+            _write_clipboard_windows(text)
+            return
+        except RuntimeError:
+            pass
+
+    if sys.platform.startswith("linux"):
+        try:
+            _write_clipboard_linux(text)
+            return
+        except RuntimeError:
+            pass
+
+    try:
+        import pyperclip  # type: ignore
+    except ImportError:
+        pyperclip = None
+
+    if pyperclip is not None:
+        try:
+            pyperclip.copy(text)
+            return
+        except Exception:
+            pass
+
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+        try:
+            root.withdraw()
+            root.clipboard_clear()
+            root.clipboard_append(text)
+            root.update()
+        finally:
+            root.destroy()
+    except Exception as e:
+        raise RuntimeError(
+            "无法写入剪贴板：请安装 wl-clipboard（Wayland）或 xclip/xsel（X11），"
+            "并确认当前会话可以访问图形桌面剪贴板。"
+        ) from e
+
+
+def _run_clipboard_command(command: List[str], stdin: str = "") -> str:
+    try:
+        completed = subprocess.run(
+            command,
+            input=stdin,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+        )
+    except Exception as e:
+        raise RuntimeError(str(e)) from e
+
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(message or f"{command[0]} 执行失败")
+
+    return completed.stdout
+
+
+def _available_command(command: str) -> bool:
+    return shutil.which(command) is not None
+
+
+def _read_clipboard_linux() -> str:
+    readers = [
+        ["wl-paste", "--no-newline"],
+        ["xclip", "-selection", "clipboard", "-out"],
+        ["xsel", "--clipboard", "--output"],
+    ]
+
+    errors: List[str] = []
+
+    for command in readers:
+        if not _available_command(command[0]):
+            continue
+
+        try:
+            return _run_clipboard_command(command)
+        except RuntimeError as e:
+            errors.append(f"{command[0]}: {e}")
+
+    detail = "；".join(errors) if errors else "未找到 wl-paste、xclip 或 xsel"
+    raise RuntimeError(
+        "无法读取 Ubuntu 剪贴板。请安装 wl-clipboard（Wayland）或 xclip/xsel（X11）。"
+        f"详情：{detail}"
+    )
+
+
+def _write_clipboard_linux(text: str) -> None:
+    writers = [
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+    ]
+
+    errors: List[str] = []
+
+    for command in writers:
+        if not _available_command(command[0]):
+            continue
+
+        try:
+            _run_clipboard_command(command, stdin=text)
+            return
+        except RuntimeError as e:
+            errors.append(f"{command[0]}: {e}")
+
+    detail = "；".join(errors) if errors else "未找到 wl-copy、xclip 或 xsel"
+    raise RuntimeError(
+        "无法写入 Ubuntu 剪贴板。请安装 wl-clipboard（Wayland）或 xclip/xsel（X11）。"
+        f"详情：{detail}"
+    )
+
+
+def _run_powershell(script: str, stdin: str = "") -> str:
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    last_error = "PowerShell 不可用"
+
+    for executable in ("powershell.exe", "pwsh.exe"):
+        try:
+            completed = subprocess.run(
+                [
+                    executable,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    script,
+                ],
+                input=stdin,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=10,
+                creationflags=creationflags,
+            )
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        if completed.returncode == 0:
+            return completed.stdout
+
+        last_error = completed.stderr.strip() or completed.stdout.strip()
+
+    raise RuntimeError(last_error)
+
+
+def _read_clipboard_windows() -> str:
+    script = """
+$ErrorActionPreference = 'Stop'
+$text = Get-Clipboard -Raw
+if ($null -eq $text) { $text = '' }
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($text))
+"""
+    output = _run_powershell(script).strip()
+
+    if not output:
+        return ""
+
+    try:
+        return base64.b64decode(output).decode("utf-8")
+    except Exception as e:
+        raise RuntimeError("无法解析剪贴板内容") from e
+
+
+def _write_clipboard_windows(text: str) -> None:
+    script = """
+$ErrorActionPreference = 'Stop'
+$b64 = [Console]::In.ReadToEnd()
+$text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+Set-Clipboard -Value $text
+"""
+    encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    _run_powershell(script, stdin=encoded)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="把网页版 ChatGPT 复制出的半损坏公式文本转换为 Markdown + LaTeX。"
+    )
+
+    parser.add_argument(
+        "input",
+        nargs="?",
+        help="输入文本文件。省略时从 stdin 读取；配合 --from-clipboard 时从剪贴板读取。",
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="输出 markdown 文件。省略时输出到 stdout。",
+    )
+
+    parser.add_argument(
+        "--from-clipboard",
+        action="store_true",
+        help="从剪贴板读取输入。",
+    )
+
+    parser.add_argument(
+        "--to-clipboard",
+        action="store_true",
+        help="把转换结果写回剪贴板。",
+    )
+
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="严格模式：不自动把 (q)、(M)、(y) 这类单字母括号转成公式。",
+    )
+
+    parser.add_argument(
+        "--no-repair",
+        action="store_true",
+        help="不修复公式内部疑似损坏的下标，例如 }*{ -> }_{。",
+    )
+
+    parser.add_argument(
+        "--no-report",
+        action="store_true",
+        help="不在 stderr 输出转换报告。",
+    )
+
+    args = parser.parse_args()
+
+    if args.from_clipboard:
+        raw = read_clipboard()
+    elif args.input:
+        raw = Path(args.input).read_text(encoding="utf-8")
+    else:
+        raw = sys.stdin.read()
+
+    converted, stats = convert_text(
+        raw,
+        allow_single_letter=not args.strict,
+        do_repair=not args.no_repair,
+    )
+
+    if args.output:
+        Path(args.output).write_text(converted, encoding="utf-8")
+    else:
+        print(converted)
+
+    if args.to_clipboard:
+        write_clipboard(converted)
+
+    if not args.no_report:
+        print("", file=sys.stderr)
+        print(format_report(stats), file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
