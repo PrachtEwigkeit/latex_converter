@@ -115,9 +115,9 @@ def protect_sensitive_regions(
         if do_repair:
             inner = block[2:-2]
             inner = repair_copied_display_math_lines(inner, ph.stats)
-            before_hash_repair = inner
-            inner = repair_latex_hashes(inner)
-            if inner != before_hash_repair:
+            before_syntax_repair = inner
+            inner = repair_latex_syntax(inner)
+            if inner != before_syntax_repair:
                 ph.stats.subscript_repairs += 1
             block = f"$${inner}$$"
         return ph.add(block, "EXISTING_DISPLAY_MATH")
@@ -133,9 +133,9 @@ def protect_sensitive_regions(
         block = m.group(0)
         if do_repair:
             inner = block[1:-1]
-            before_hash_repair = inner
-            inner = repair_latex_hashes(inner)
-            if inner != before_hash_repair:
+            before_syntax_repair = inner
+            inner = repair_latex_syntax(inner)
+            if inner != before_syntax_repair:
                 ph.stats.subscript_repairs += 1
             block = f"${inner}$"
         return ph.add(block, "EXISTING_INLINE_MATH")
@@ -466,7 +466,7 @@ def repair_formula(formula: str, stats: Stats) -> str:
 
     # J(q)^# -> J(q)^{\#}
     # KaTeX/LaTeX treats a raw # as a special character, so escape it.
-    formula = repair_latex_hashes(formula)
+    formula = repair_latex_syntax(formula)
 
     # 清理多余空格
     formula = re.sub(r"[ \t]+", " ", formula).strip()
@@ -477,13 +477,24 @@ def repair_formula(formula: str, stats: Stats) -> str:
     return formula
 
 
-def repair_latex_hashes(formula: str) -> str:
+def repair_latex_syntax(formula: str) -> str:
     """
-    修复 KaTeX/LaTeX 中未转义的 #。
+    修复常见的 KaTeX/LaTeX 语法错误。
     """
 
     formula = re.sub(r"\^\s*#", r"^{\\#}", formula)
     formula = re.sub(r"(?<!\\)#", r"\\#", formula)
+
+    # \left{ ... \right} -> \left\{ ... \right\}
+    # 同时兼容 \bigl{、\bigr} 等可伸缩定界符命令。
+    sized_delimiter = re.compile(
+        r"\\(left|right|bigl|bigr|Bigl|Bigr|biggl|biggr|Biggl|Biggr|big|Big|bigg|Bigg)\s*([{}])"
+    )
+    formula = sized_delimiter.sub(
+        lambda match: f"\\{match.group(1)}\\{match.group(2)}",
+        formula,
+    )
+
     return formula
 
 
