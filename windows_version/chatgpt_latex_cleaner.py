@@ -32,6 +32,7 @@ class Stats:
     low_confidence_inline: List[Tuple[str, str, float, str]] = field(default_factory=list)
     subscript_repairs: int = 0
     display_math_line_repairs: int = 0
+    math_text_repairs: int = 0
     skipped_unclosed_display_blocks: int = 0
 
     def add_protected(self, kind: str) -> None:
@@ -115,7 +116,7 @@ def protect_sensitive_regions(
             inner = block[2:-2]
             inner = repair_copied_display_math_lines(inner, ph.stats)
             before_syntax_repair = inner
-            inner = repair_latex_syntax(inner)
+            inner = repair_latex_syntax(inner, ph.stats)
             if inner != before_syntax_repair:
                 ph.stats.subscript_repairs += 1
             block = f"$${inner}$$"
@@ -133,7 +134,7 @@ def protect_sensitive_regions(
         if do_repair:
             inner = block[1:-1]
             before_syntax_repair = inner
-            inner = repair_latex_syntax(inner)
+            inner = repair_latex_syntax(inner, ph.stats)
             if inner != before_syntax_repair:
                 ph.stats.subscript_repairs += 1
             block = f"${inner}$"
@@ -465,7 +466,7 @@ def repair_formula(formula: str, stats: Stats) -> str:
 
     # J(q)^# -> J(q)^{\#}
     # KaTeX/LaTeX treats a raw # as a special character, so escape it.
-    formula = repair_latex_syntax(formula)
+    formula = repair_latex_syntax(formula, stats)
 
     # 清理多余空格
     formula = re.sub(r"[ \t]+", " ", formula).strip()
@@ -476,10 +477,14 @@ def repair_formula(formula: str, stats: Stats) -> str:
     return formula
 
 
-def repair_latex_syntax(formula: str) -> str:
+def repair_latex_syntax(formula: str, stats: Optional[Stats] = None) -> str:
     """
     修复常见的 KaTeX/LaTeX 语法错误。
     """
+
+    formula, text_repairs = repair_math_text_segments(formula)
+    if stats is not None and text_repairs:
+        stats.math_text_repairs += text_repairs
 
     formula = re.sub(r"\^\s*#", r"^{\\#}", formula)
     formula = re.sub(r"(?<!\\)#", r"\\#", formula)
@@ -495,6 +500,102 @@ def repair_latex_syntax(formula: str) -> str:
     )
 
     return formula
+
+
+def find_matching_brace(text: str, open_index: int) -> int:
+    depth = 0
+
+    for i in range(open_index, len(text)):
+        ch = text[i]
+
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+
+            if depth == 0:
+                return i
+
+    return -1
+
+
+def is_cjk_text_char(ch: str) -> bool:
+    return (
+        "\u4e00" <= ch <= "\u9fff"
+        or ch in "，。！？、；：（）《》“”‘’…"
+    )
+
+
+def has_cjk_letter(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text))
+
+
+def should_consume_stray_text_brace(formula: str, brace_index: int, segment: str) -> bool:
+    if not has_cjk_letter(segment):
+        return False
+
+    j = brace_index + 1
+    while j < len(formula) and formula[j] in " \t":
+        j += 1
+
+    if j >= len(formula) or formula[j] in "\r\n}]":
+        return False
+
+    return formula[j].isalnum() or formula[j] in r"\({["
+
+
+def repair_math_text_segments(formula: str) -> Tuple[str, int]:
+    r"""
+    修复数学模式中裸露的中文文本段。
+
+    ChatGPT 网页复制有时会把：
+
+        \text{幅度平方函数给的是 }H(s)H(-s)，不是直接给 }H(s)。
+
+    复制成不合法的 LaTeX。这里把裸露中文重新包回 \text{...}，
+    并只在后面紧跟数学项时吞掉那个多余的文本闭合括号。
+    """
+
+    out: List[str] = []
+    repairs = 0
+    i = 0
+
+    while i < len(formula):
+        if formula.startswith(r"\text{", i):
+            close_index = find_matching_brace(formula, i + len(r"\text"))
+            if close_index != -1:
+                out.append(formula[i : close_index + 1])
+                i = close_index + 1
+                continue
+
+        ch = formula[i]
+
+        if is_cjk_text_char(ch):
+            start = i
+            i += 1
+
+            while i < len(formula) and (
+                is_cjk_text_char(formula[i]) or formula[i] in " \t"
+            ):
+                i += 1
+
+            segment = formula[start:i]
+
+            if i < len(formula) and formula[i] == "}" and should_consume_stray_text_brace(
+                formula,
+                i,
+                segment,
+            ):
+                i += 1
+
+            out.append(r"\text{" + segment + "}")
+            repairs += 1
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out), repairs
 
 
 def operator_from_copied_rule_line(line: str) -> Optional[str]:
@@ -601,6 +702,7 @@ def format_report(stats: Stats, max_low_confidence: int = 30) -> str:
     lines.append(f"行内公式转换：{stats.inline_math}")
     lines.append(f"公式内部修复：{stats.subscript_repairs}")
     lines.append(f"公式换行伪影修复：{stats.display_math_line_repairs}")
+    lines.append(f"公式中文文本修复：{stats.math_text_repairs}")
     lines.append(f"未闭合块公式跳过：{stats.skipped_unclosed_display_blocks}")
 
     if stats.protected:
