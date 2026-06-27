@@ -34,6 +34,7 @@ class Stats:
     subscript_repairs: int = 0
     display_math_line_repairs: int = 0
     math_text_repairs: int = 0
+    math_row_break_repairs: int = 0
     skipped_unclosed_display_blocks: int = 0
 
     def add_protected(self, kind: str) -> None:
@@ -483,6 +484,10 @@ def repair_latex_syntax(formula: str, stats: Optional[Stats] = None) -> str:
     修复常见的 KaTeX/LaTeX 语法错误。
     """
 
+    formula, row_break_repairs = repair_multiline_math_row_breaks(formula)
+    if stats is not None and row_break_repairs:
+        stats.math_row_break_repairs += row_break_repairs
+
     formula, text_repairs = repair_math_text_segments(formula)
     if stats is not None and text_repairs:
         stats.math_text_repairs += text_repairs
@@ -501,6 +506,48 @@ def repair_latex_syntax(formula: str, stats: Optional[Stats] = None) -> str:
     )
 
     return formula
+
+
+MULTILINE_MATH_ENVIRONMENT_RE = re.compile(
+    r"\\begin\{(?P<env>"
+    r"array|aligned|alignedat|gathered|split|cases|"
+    r"matrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix|smallmatrix"
+    r")\}(?P<body>.*?)\\end\{(?P=env)\}",
+    re.DOTALL,
+)
+
+
+def repair_multiline_math_row_breaks(formula: str) -> Tuple[str, int]:
+    r"""
+    修复多行数学环境中被复制成单个反斜杠的行分隔符。
+
+    只处理行尾的单个 ``\``，正确的 ``\\`` 和 ``\hline`` 等命令不受影响。
+    """
+
+    total_repairs = 0
+
+    def repair_environment(match: re.Match) -> str:
+        nonlocal total_repairs
+
+        body = match.group("body")
+        repaired_body, repairs = re.subn(
+            r"(?m)(?<!\\)\\(?=[ \t]*(?:\n|\Z))",
+            r"\\\\",
+            body,
+        )
+        total_repairs += repairs
+
+        return (
+            rf"\begin{{{match.group('env')}}}"
+            f"{repaired_body}"
+            rf"\end{{{match.group('env')}}}"
+        )
+
+    repaired_formula = MULTILINE_MATH_ENVIRONMENT_RE.sub(
+        repair_environment,
+        formula,
+    )
+    return repaired_formula, total_repairs
 
 
 def find_matching_brace(text: str, open_index: int) -> int:
@@ -704,6 +751,7 @@ def format_report(stats: Stats, max_low_confidence: int = 30) -> str:
     lines.append(f"公式内部修复：{stats.subscript_repairs}")
     lines.append(f"公式换行伪影修复：{stats.display_math_line_repairs}")
     lines.append(f"公式中文文本修复：{stats.math_text_repairs}")
+    lines.append(f"多行公式行分隔符修复：{stats.math_row_break_repairs}")
     lines.append(f"未闭合块公式跳过：{stats.skipped_unclosed_display_blocks}")
 
     if stats.protected:
