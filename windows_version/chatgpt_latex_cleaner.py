@@ -184,35 +184,6 @@ def protect_sensitive_regions(
     return text
 
 
-def is_display_math_like(content: str) -> bool:
-    """
-    判断单独 [ ... ] 里面的内容是否像块公式。
-    """
-    s = content.strip()
-
-    if not s:
-        return False
-
-    if "@@__CGPT_LATEX_" in s:
-        return False
-
-    if "\\" in s:
-        return True
-
-    if any(ch in s for ch in "=<>^_∈∉⊂⊆≈≠≤≥→←↦±×·∂∑∫∞"):
-        return True
-
-    if re.search(r"\b(?:dim|Null|Rank|FK|IK|SE|SO|log|sin|cos|tan|exp)\b", s):
-        return True
-
-    # 短的纯符号块，也很可能是公式
-    if not re.search(r"[\u4e00-\u9fff]", s) and len(s) <= 200:
-        if re.search(r"[A-Za-z]", s):
-            return True
-
-    return False
-
-
 def convert_display_math_blocks(text: str, stats: Stats, do_repair: bool = True) -> str:
     """
     把 ChatGPT 复制出来的：
@@ -245,20 +216,19 @@ def convert_display_math_blocks(text: str, stats: Stats, do_repair: bool = True)
             if j < len(lines) and lines[j].strip() == "]":
                 content = "\n".join(block).strip("\n")
 
-                if is_display_math_like(content):
-                    if do_repair:
-                        content = repair_copied_display_math_lines(content, stats)
-                        content = repair_formula(content, stats)
+                if do_repair:
+                    content = repair_copied_display_math_lines(content, stats)
+                    content = repair_formula(content, stats)
 
-                    out.append("$$")
-                    out.extend(content.split("\n"))
-                    out.append("$$")
+                out.append("$$")
+                out.extend(content.split("\n"))
+                out.append("$$")
 
-                    stats.display_math_blocks += 1
-                    i = j + 1
-                    continue
+                stats.display_math_blocks += 1
+                i = j + 1
+                continue
 
-            # 没找到闭合 ]，或者内容不像公式，就原样保留
+            # 没找到闭合 ]，就原样保留
             if j >= len(lines):
                 stats.skipped_unclosed_display_blocks += 1
 
