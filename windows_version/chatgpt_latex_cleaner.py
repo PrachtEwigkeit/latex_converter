@@ -490,7 +490,7 @@ def repair_multiline_math_row_breaks(formula: str) -> Tuple[str, int]:
     r"""
     修复多行数学环境中被复制成单个反斜杠的行分隔符。
 
-    只处理行尾的单个 ``\``，正确的 ``\\`` 和 ``\hline`` 等命令不受影响。
+    只处理行尾或表格横线命令前的单个 ``\``，正确的 ``\\`` 和 ``\hline`` 等命令不受影响。
     """
 
     total_repairs = 0
@@ -499,12 +499,17 @@ def repair_multiline_math_row_breaks(formula: str) -> Tuple[str, int]:
         nonlocal total_repairs
 
         body = match.group("body")
-        repaired_body, repairs = re.subn(
-            r"(?m)(?<!\\)\\(?=[ \t]*(?:\n|\Z))",
+        repaired_body, repairs_before_rule = re.subn(
+            r"(?m)(?<!\\)\\(?=[ \t]*\\(?:hline|cline|toprule|midrule|bottomrule|cmidrule)\b)",
             r"\\\\",
             body,
         )
-        total_repairs += repairs
+        repaired_body, repairs_at_line_end = re.subn(
+            r"(?m)(?<!\\)\\(?=[ \t]*(?:\n|\Z))",
+            r"\\\\",
+            repaired_body,
+        )
+        total_repairs += repairs_before_rule + repairs_at_line_end
 
         return (
             rf"\begin{{{match.group('env')}}}"
