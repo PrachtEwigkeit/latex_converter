@@ -276,9 +276,6 @@ def decide_math_like(content: str, allow_single_letter: bool = True) -> MathDeci
     if re.search(r"https?://|www\.|[\w.-]+@[\w.-]+", s):
         return MathDecision(False, reason="url_or_email")
 
-    if "[" in s or "]" in s:
-        return MathDecision(False, reason="markdown_link_like")
-
     if re.fullmatch(r"\d+(?:\.\d+)?", s):
         return MathDecision(False, reason="plain_number")
 
@@ -287,6 +284,9 @@ def decide_math_like(content: str, allow_single_letter: bool = True) -> MathDeci
     # 强特征 1：LaTeX 命令
     if "\\" in s:
         return MathDecision(True, 0.98, "latex_command")
+
+    if "[" in s or "]" in s:
+        return MathDecision(False, reason="markdown_link_like")
 
     # 强特征 2：数学符号、关系符号、上下标
     if any(ch in s for ch in "=<>^_∈∉⊂⊆≈≠≤≥→←↦±×·∂∑∫∞"):
@@ -486,12 +486,27 @@ MULTILINE_MATH_ENVIRONMENT_RE = re.compile(
     re.DOTALL,
 )
 
+MATRIX_LIKE_ENVIRONMENTS = {
+    "matrix",
+    "pmatrix",
+    "bmatrix",
+    "Bmatrix",
+    "vmatrix",
+    "Vmatrix",
+    "smallmatrix",
+}
+
+COMPACT_MATRIX_ROW_SEPARATOR_RE = re.compile(
+    r"(?m)(?<=[A-Za-z0-9}_\]\)])\\[ \t]*(?=[A-Za-z](?=[_^])|\d)"
+)
+
 
 def repair_multiline_math_row_breaks(formula: str) -> Tuple[str, int]:
     r"""
     修复多行数学环境中被复制成单个反斜杠的行分隔符。
 
-    只处理行尾或表格横线命令前的单个 ``\``，正确的 ``\\`` 和 ``\hline`` 等命令不受影响。
+    只处理行尾、表格横线命令前或紧凑矩阵行之间的单个 ``\``。
+    正确的 ``\\`` 和 ``\hline`` 等命令不受影响。
     """
 
     total_repairs = 0
@@ -505,12 +520,20 @@ def repair_multiline_math_row_breaks(formula: str) -> Tuple[str, int]:
             r"\\\\",
             body,
         )
+        repairs_compact_matrix = 0
+        if match.group("env") in MATRIX_LIKE_ENVIRONMENTS:
+            repaired_body, repairs_compact_matrix = COMPACT_MATRIX_ROW_SEPARATOR_RE.subn(
+                lambda _match: "\\\\\n",
+                repaired_body,
+            )
         repaired_body, repairs_at_line_end = re.subn(
             r"(?m)(?<!\\)\\(?=[ \t]*(?:\n|\Z))",
             r"\\\\",
             repaired_body,
         )
-        total_repairs += repairs_before_rule + repairs_at_line_end
+        total_repairs += (
+            repairs_before_rule + repairs_compact_matrix + repairs_at_line_end
+        )
 
         return (
             rf"\begin{{{match.group('env')}}}"
