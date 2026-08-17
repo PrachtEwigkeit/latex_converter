@@ -458,6 +458,10 @@ def repair_latex_syntax(formula: str, stats: Optional[Stats] = None) -> str:
     if stats is not None and row_break_repairs:
         stats.math_row_break_repairs += row_break_repairs
 
+    formula, text_font_repairs = repair_nested_text_font_commands(formula)
+    if stats is not None and text_font_repairs:
+        stats.math_text_repairs += text_font_repairs
+
     formula, text_repairs = repair_math_text_segments(formula)
     if stats is not None and text_repairs:
         stats.math_text_repairs += text_repairs
@@ -485,6 +489,8 @@ MULTILINE_MATH_ENVIRONMENT_RE = re.compile(
     r")\}(?P<body>.*?)\\end\{(?P=env)\}",
     re.DOTALL,
 )
+
+TEXT_FONT_WRAPPER_RE = re.compile(r"\\(?P<cmd>textbf)\s*\{")
 
 MATRIX_LIKE_ENVIRONMENTS = {
     "matrix",
@@ -546,6 +552,90 @@ def repair_multiline_math_row_breaks(formula: str) -> Tuple[str, int]:
         formula,
     )
     return repaired_formula, total_repairs
+
+
+def repair_nested_text_font_commands(formula: str) -> Tuple[str, int]:
+    r"""
+    修复 ``\textbf{\text{...}Word \text{...}}`` 这类混合文本。
+
+    在数学环境里，纯文本优先整理成 ``\text{\textbf{...}}``。如果原内容
+    跨多行，就使用 ``gathered`` 保留换行，避免在 ``\boxed`` 内出现裸换行文本。
+    """
+
+    out: List[str] = []
+    repairs = 0
+    i = 0
+
+    while i < len(formula):
+        match = TEXT_FONT_WRAPPER_RE.match(formula, i)
+
+        if match:
+            open_index = match.end() - 1
+            close_index = find_matching_brace(formula, open_index)
+
+            if close_index != -1:
+                body = formula[open_index + 1 : close_index]
+                flattened, text_chunks = flatten_text_command_body(body)
+
+                if flattened is not None and text_chunks > 0:
+                    out.append(format_text_font_replacement(match.group("cmd"), flattened))
+                    repairs += 1
+                    i = close_index + 1
+                    continue
+
+        out.append(formula[i])
+        i += 1
+
+    return "".join(out), repairs
+
+
+def flatten_text_command_body(body: str) -> Tuple[Optional[str], int]:
+    r"""
+    展开文本字体命令内部的 ``\text{...}``。
+
+    只允许 ``\text{...}`` 之间夹普通文本词和标点；遇到 ``_``、``^``、
+    其他 LaTeX 命令等数学内容时放弃修复，避免把真实公式误压成文本。
+    """
+
+    out: List[str] = []
+    text_chunks = 0
+    i = 0
+
+    while i < len(body):
+        if body.startswith(r"\text{", i):
+            close_index = find_matching_brace(body, i + len(r"\text"))
+            if close_index == -1:
+                return None, 0
+
+            out.append(body[i + len(r"\text{") : close_index])
+            text_chunks += 1
+            i = close_index + 1
+            continue
+
+        ch = body[i]
+
+        if ch == "\\" or ch in "_^&={}":
+            return None, 0
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out), text_chunks
+
+
+def format_text_font_replacement(command: str, text: str) -> str:
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+
+    if not lines:
+        return rf"\{command}{{}}"
+
+    rows = [rf"\text{{\{command}{{{line}}}}}" for line in lines]
+
+    if len(rows) == 1:
+        return rows[0]
+
+    return "\\begin{gathered}\n" + "\\\\\n".join(rows) + "\n\\end{gathered}"
 
 
 def find_matching_brace(text: str, open_index: int) -> int:
